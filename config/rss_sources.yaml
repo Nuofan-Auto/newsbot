@@ -1,0 +1,19 @@
+sources:
+  # English sources
+  - name: BBC News
+    url: http://feeds.bbci.co.uk/news/rss.xml
+    lang: en
+  - name: Reuters
+    url: https://news.google.com/rss/search?q=site:reuters.com&hl=en-US&gl=US&ceid=US:en
+    lang: en
+  - name: TechCrunch
+    url: https://techcrunch.com/feed/
+    lang: en
+
+  # Chinese sources
+  - name: 36氪
+    url: https://36kr.com/feed
+    lang: zh
+  - name: 少数派
+    url: https://sspai.com/feed
+    lang: zh

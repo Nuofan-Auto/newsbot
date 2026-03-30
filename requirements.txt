@@ -1,0 +1,7 @@
+feedparser
+requests
+beautifulsoup4
+python-dotenv
+pyyaml
+python-telegram-bot[socks]
+httpx[socks]
