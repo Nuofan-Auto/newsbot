@@ -2,6 +2,7 @@
 NewsAnalyzer: calls the LLM provider once per article to produce
 summary, comment, and category.
 """
+import json
 import logging
 from typing import Any
 
@@ -35,6 +36,14 @@ class NewsAnalyzer:
                 "summary": "【分析失败】",
                 "comment": "【分析失败】",
                 "category": "其它",
+                "opinions": [],
             }
             llm_ok = False
+
+        # Serialise opinions into comments_json for both zh and en.
+        # For en, pipeline will overwrite with HN comments if available.
+        opinions = result.pop("opinions", [])
+        if opinions:
+            result["comments_json"] = json.dumps(opinions, ensure_ascii=False)
+
         return {**article, **result, "_llm_ok": llm_ok}

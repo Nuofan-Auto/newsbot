@@ -2,6 +2,7 @@
 Telegram Bot for AI News Aggregator.
 """
 import asyncio
+import json
 import logging
 from collections import defaultdict
 from telegram import Update
@@ -57,8 +58,12 @@ def _select_articles(articles: list[dict], total: int) -> tuple[list[dict], list
     Split *total* quota between zh and en with category balance (max 40% per category).
     Returns (zh_selected, en_selected).
     """
-    zh_pool = [a for a in articles if a.get("lang") == "zh" and a.get("summary") and a.get("summary") != "【分析失败】"]
-    en_pool = [a for a in articles if a.get("lang") != "zh" and a.get("summary") and a.get("summary") != "【分析失败】"]
+    def _is_enriched(a: dict) -> bool:
+        return (bool(a.get("summary")) and a.get("summary") != "【分析失败】"
+                and bool(a.get("comment")) and a.get("comment") != "【分析失败】")
+
+    zh_pool = [a for a in articles if a.get("lang") == "zh" and _is_enriched(a)]
+    en_pool = [a for a in articles if a.get("lang") != "zh" and _is_enriched(a)]
 
     zh_quota = total // 2
     en_quota = total - zh_quota
@@ -140,10 +145,25 @@ def _build_lang_block(articles: list[dict], serial_start: int) -> tuple[str, int
             llm_summary = _escape(a.get("summary") or "")
             comment = _escape(a.get("comment") or "")
             link = a.get("link", "")
+
+            comments_block = ""
+            try:
+                opinions = json.loads(a.get("comments_json") or "[]")[:3]
+                if opinions:
+                    label = "热评" if a.get("lang") == "zh" else "Reactions"
+                    bullets = "\n".join(
+                        f"   • {_escape(str(o))}"
+                        for o in opinions
+                    )
+                    comments_block = f"\n   💬 *{label}：*\n{bullets}"
+            except (json.JSONDecodeError, TypeError):
+                pass
+
             entry = (
                 f"{serial}\\. {title}\n"
                 f"   📝 {llm_summary}\n"
-                f"   💡 {comment}\n"
+                f"   💡 {comment}"
+                f"{comments_block}\n"
                 f"   🔗 [阅读全文]({link})"
             )
             lines.append(entry)

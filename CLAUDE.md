@@ -14,9 +14,14 @@ python main.py
 # Test pipeline without Telegram (fetch + analyze all articles)
 python scripts/test_fetch.py
 
+# Test single article with real LLM API
+python scripts/test_single.py
+
 # Run with environment variables
 cp .env.example .env   # then fill in API keys
 ```
+
+Both test scripts call `load_dotenv()` to read `.env` — required for real LLM providers.
 
 ## Environment Variables
 
@@ -24,38 +29,39 @@ See `.env.example`. Required:
 - `TELEGRAM_BOT_TOKEN` — mandatory to run the bot
 
 LLM provider keys (first available wins; falls back to Mock if none set):
-1. `GLM_API_KEY` (ZhipuAI GLM-4.5-Flash) — preferred
-2. `CLAUDE_API_KEY` (Anthropic claude-sonnet-4-6)
-3. `MINIMAX_API_KEY` (MiniMax-Text-01)
+1. `GLM_API_KEY` (ZhipuAI `glm-5`) — preferred
+2. `CLAUDE_API_KEY` (Anthropic `claude-sonnet-4-6`)
+3. `MINIMAX_API_KEY` (MiniMax `MiniMax-Text-01`)
 
 ## Architecture
 
-This is a Telegram bot that aggregates RSS news, scores source credibility, enriches articles with LLM analysis, and delivers curated digests.
+Telegram bot that aggregates Chinese and English RSS news, scores source credibility, enriches articles with LLM analysis, and delivers bilingual curated digests.
 
 **Data flow:**
 ```
-RSS Feeds → RSSFetcher (_strip_html) → NewsPipeline._enrich() → ArticleStore (SQLite cache)
-                                                ↓
-                               CredibilityAnalyzer + LLM Provider
-                                                ↓
-                               NewsBot Telegram commands (/news, /sources)
+RSS Feeds → RSSFetcher (lang per source) → NewsPipeline._enrich() → ArticleStore (SQLite cache)
+                                                    ↓
+                                       CredibilityAnalyzer + LLM Provider
+                                                    ↓
+                                       NewsBot: /news → zh block / en block
 ```
 
 ### Core modules (`src/news_aggregator/`)
 
 | Module | Purpose |
 |--------|---------|
-| `pipeline.py` | Orchestrates fetch → credibility → LLM → cache; `_select_candidates()` splits quota zh/en |
-| `storage.py` | SQLite persistence at `data/articles.db`, keyed on article URL |
-| `scrapers/rss_fetcher.py` | Fetches and parses RSS feeds via `feedparser`; `_strip_html()` cleans raw RSS content |
-| `analysis/credibility.py` | MBFC-style source ratings (credibility score 1–10, bias label) |
-| `llm/provider.py` | Pluggable LLM providers with `get_provider()` factory; `build_prompt()` is language-aware |
-| `llm/analyzer.py` | Wraps provider; calls `analyze(article)` → `{summary, comment, category}` |
-| `bot/telegram_bot.py` | Telegram handlers: `/start`, `/help`, `/news [n]`, `/sources` |
+| `pipeline.py` | Orchestrates fetch → credibility → LLM → cache; `_select_candidates()` splits zh/en quota for LLM calls; `_rank_by_credibility()` scores by credibility × 100 − feed position |
+| `storage.py` | SQLite at `data/articles.db` keyed on URL; `get_cached()` returns `None` when `llm_summary IS NULL` (not just when row is absent); `delete_older_than(days)` purges stale rows |
+| `scrapers/rss_fetcher.py` | `feedparser`-based fetcher; accepts `source_langs` list, stamps each article with `lang` field |
+| `scrapers/hn_comments.py` | Fetches top N HN comments via Algolia API for English articles; returns `[]` on miss |
+| `analysis/credibility.py` | MBFC-style ratings (score 1–10, bias label); unknown sources fall back to score=5 via plain dict (use `hasattr(rating, "credibility_score")` to guard) |
+| `llm/provider.py` | `get_provider()` factory; `build_prompt(title, content, lang)` switches between Chinese and English prompts; GLM and Claude use `anthropic` SDK; MiniMax uses HTTP with retry |
+| `llm/analyzer.py` | Extracts `lang` from article dict, passes to `provider.analyze(title, content, lang)`; serializes `opinions` → `comments_json` |
+| `bot/telegram_bot.py` | `_select_articles()` applies zh/en quota + 40% category cap; `_build_lang_block()` renders category-grouped text; `/news` sends zh block → separator → en block |
 
 ### RSS Sources
 
-Configured in `config/rss_sources.yaml`. Current sources:
+Configured in `config/rss_sources.yaml` with `name`, `url`, and `lang` fields.
 
 | Name | Language |
 |------|----------|
@@ -65,53 +71,93 @@ Configured in `config/rss_sources.yaml`. Current sources:
 | 36氪 | zh |
 | 少数派 | zh |
 
-To add a source: append an entry with `name`, `url`, and `lang` fields.
+To add a source: append an entry with `name`, `url`, and `lang`.
 
 ### Quota control (`/news [n]`)
 
-`_select_candidates()` in `pipeline.py` and `_select_articles()` in `telegram_bot.py` both implement:
-- zh quota = N // 2, en quota = N - N // 2
-- If one language pool is short, remainder goes to the other
-- Within each language, articles ranked by credibility score and position within source
-- Category balance capped at 40% per category per language (`CATEGORY_MAX_RATIO`)
+Two-stage selection — pipeline then bot:
+
+1. **`pipeline._select_candidates(labelled, top_n)`** — selects LLM candidates before API calls:
+   - zh quota = N // 2, en quota = N − N // 2
+   - Overflow from short side goes to the other
+   - Only candidates get LLM-enriched; rest returned with credibility label only
+
+2. **`bot._select_articles(articles, total)`** — final display selection after LLM:
+   - Same zh/en quota split
+   - Within each language: category cap at 40% of quota (`CATEGORY_MAX_RATIO`)
+   - Filters out articles with `【分析失败】`
 
 ### LLM provider pattern
 
-All providers inherit `BaseLLMProvider` (ABC) and implement `analyze(title, content, lang) → dict`. The `lang` parameter controls prompt language: `"zh"` generates Chinese summary/comment; anything else generates English. Content is truncated to 600 chars before being sent to the LLM. To add a new provider: subclass `BaseLLMProvider`, add env var check to `get_provider()` in `provider.py`.
+All providers inherit `BaseLLMProvider` (ABC) and implement `analyze(title, content, lang) → dict`.
+- `lang="zh"` → Chinese prompt, Chinese summary/comment output
+- `lang="en"` → English prompt, English summary/comment output
+
+**GLMProvider**: uses `anthropic` SDK with `base_url="https://open.bigmodel.cn/api/anthropic"` (the SDK appends `/v1/messages` automatically). `max_tokens=1024`.
+
+**ClaudeProvider**: uses `anthropic` SDK with no `base_url`. `max_tokens=512`.
+
+**MiniMaxProvider**: uses raw `requests` HTTP with 3-attempt retry loop and `base_resp.status_code` / `output_sensitive` checks. No `anthropic` SDK (no official Anthropic-compatible base_url).
+
+To add a new provider: subclass `BaseLLMProvider`, implement `analyze()`, add env var check to `get_provider()`.
 
 ### Caching
 
-`NewsPipeline._enrich()` checks `ArticleStore.get_cached(link)` before calling the LLM. Cached results (llm_summary, llm_comment, llm_category) are reused on subsequent runs. Only successful LLM calls (`_llm_ok=True`) are written to cache. To force re-analysis, delete rows from `data/articles.db`.
+`NewsPipeline._enrich()` checks `ArticleStore.get_cached(link)` before calling the LLM:
+- Cache hit → reuse stored `{summary, comment, category, comments_json}`, skip LLM
+- Cache miss → call LLM; write to DB **only if `_llm_ok=True`** (failed calls are never cached)
+- `get_cached()` returns `None` when `llm_summary IS NULL` — prevents truthy-but-empty dict hits
+- `upsert()` stores original RSS text in `summary_raw`, LLM output in `llm_summary` (separate columns)
+
+**Cache cleanup**: `pipeline.run()` calls `store.delete_older_than(CACHE_MAX_DAYS)` on every run. Default is 7 days; override with `CACHE_MAX_DAYS` env var.
+
+To force re-analysis: delete rows from `data/articles.db` or `rm data/articles.db`.
 
 ### Adding credibility sources
 
-Pass `extra_sources` dict to `CredibilityAnalyzer.__init__()`, or call `load_sources()` at runtime. Built-in entries: BBC News, Reuters, TechCrunch, CNN, Fox News.
+Pass `extra_sources` dict to `CredibilityAnalyzer.__init__()`, or call `load_sources()` at runtime. Built-in entries: BBC News, Reuters, TechCrunch, CNN, Fox News. Unknown sources return a plain dict with score=5 — always guard with `hasattr(rating, "credibility_score")`.
 
 ## LLM Output Format
 
-The prompt (`build_prompt()` in `llm/provider.py`) requests JSON with exactly these fields:
+`build_prompt()` in `llm/provider.py` requests JSON with exactly these fields:
 ```json
-{"summary": "...", "comment": "...", "category": "..."}
+{"summary": "...", "comment": "...", "category": "...", "opinions": ["...", "..."]}
 ```
 Categories: `"AI科技"`, `"经济金融"`, `"国际政治"`, `"民生社会"`, `"科学探索"`, `"其它"`
 
-Summary and comment language match the article's `lang` field (zh → Chinese, en → English).
+`opinions` is a 2–3 item array of short public-reaction strings (zh or en depending on `lang`). It is optional — `parse_llm_response()` normalizes missing/invalid values to `[]`. `analyzer.py` serializes it to `comments_json` (JSON string).
+
+For English articles, `pipeline._enrich()` tries to replace LLM opinions with real HN comments via `fetch_hn_comments(title)`. HN results take priority; LLM opinions serve as fallback.
 
 ## Telegram Message Formatting
 
-Bot uses MarkdownV2. All dynamic text must pass through `_escape()` before insertion. Messages are auto-split at 4096 chars via `_split_messages()`.
+Bot uses MarkdownV2. All dynamic text must pass through `_escape()` before insertion. Messages auto-split at 4096 chars via `_split_messages()`.
 
-Push structure:
+Push structure (per `/news`):
 ```
-【🇨🇳 中文新闻】
+🇨🇳 中文新闻
+
 ━━━ 🤖 AI科技 ━━━
 1. 标题
    📝 摘要
    💡 点评
-   🔗 链接
+   💬 热评：
+   • 视角1
+   • 视角2
+   🔗 阅读全文
 
-【🌐 英文新闻】
+━━━━━━━━━━━━━━━━━━━━ (separator)
+
+🌐 英文新闻
+
 ━━━ 🤖 AI科技 ━━━
+1. Title
+   📝 Summary
+   💡 Comment
+   💬 Reactions:
+   • reaction 1
+   • reaction 2
+   🔗 Read more
 ...
 ```
-Chinese block first, then a `━` separator line, then English block. Empty categories are skipped.
+Chinese block first, `━×20` separator, then English block. Empty categories skipped. Comments block omitted when `opinions` is empty. Label is `热评` for zh articles, `Reactions` for en. Each block sent as separate messages if > 4096 chars.

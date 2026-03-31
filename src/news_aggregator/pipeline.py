@@ -1,13 +1,16 @@
 """
 NewsPipeline: orchestrates RSS fetching, credibility analysis, and LLM enrichment.
 """
+import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from news_aggregator.scrapers.rss_fetcher import RSSFetcher
+from news_aggregator.scrapers.hn_comments import fetch_hn_comments
 from news_aggregator.analysis.credibility import CredibilityAnalyzer
 from news_aggregator.llm.analyzer import NewsAnalyzer
 from news_aggregator.storage import ArticleStore
@@ -42,6 +45,9 @@ class NewsPipeline:
         If *top_n* is given, selects top_n candidates split evenly between zh/en
         by credibility score, then enriches only those with LLM.
         """
+        max_days = int(os.getenv("CACHE_MAX_DAYS", "7"))
+        self._store.delete_older_than(max_days)
+
         raw = self._fetcher.fetch_all()
 
         if top_n is not None:
@@ -101,10 +107,13 @@ class NewsPipeline:
         else:
             rss_summary = article.get("summary", "")
             article = self._llm.analyze(article)
-            if link and article.pop("_llm_ok", False):
+            llm_ok = article.pop("_llm_ok", False)
+            if llm_ok and article.get("lang") == "en":
+                hn = fetch_hn_comments(article.get("title", ""))
+                if hn:  # HN results override LLM opinions; otherwise keep LLM fallback
+                    article["comments_json"] = json.dumps(hn, ensure_ascii=False)
+            if link and llm_ok:
                 self._store.upsert({**article, "summary_raw": rss_summary})
-            else:
-                article.pop("_llm_ok", None)
 
         return article
 

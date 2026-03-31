@@ -59,35 +59,25 @@ class MockProvider(BaseLLMProvider):
 # ---------------------------------------------------------------------------
 
 class GLMProvider(BaseLLMProvider):
-    """ZhipuAI GLM via direct HTTP REST API."""
+    """ZhipuAI GLM via anthropic-compatible SDK."""
 
-    _API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    _BASE_URL = "https://open.bigmodel.cn/api/anthropic"
     _MODEL = "glm-5"
 
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key
 
     def analyze(self, title: str, content: str, lang: str = "en") -> dict:
-        import requests as _req
-        from concurrent.futures import ThreadPoolExecutor
+        import anthropic
 
+        client = anthropic.Anthropic(api_key=self._api_key, base_url=self._BASE_URL)
         prompt = build_prompt(title, content, lang)
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
-        data = {
-            "model": self._MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 1.0,
-        }
-
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_req.post, self._API_URL, headers=headers, json=data)
-            resp = future.result(timeout=60)
-
-        resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"]
+        message = client.messages.create(
+            model=self._MODEL,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = message.content[0].text
         logger.debug("GLM raw response: %s", raw)
         return parse_llm_response(raw)
 
@@ -97,32 +87,24 @@ class GLMProvider(BaseLLMProvider):
 # ---------------------------------------------------------------------------
 
 class ClaudeProvider(BaseLLMProvider):
-    """Anthropic Claude via direct HTTP REST API."""
+    """Anthropic Claude via anthropic SDK."""
 
-    _API_URL = "https://api.anthropic.com/v1/messages"
     _MODEL = "claude-sonnet-4-6"
 
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key
 
     def analyze(self, title: str, content: str, lang: str = "en") -> dict:
-        import requests as _req
+        import anthropic
 
+        client = anthropic.Anthropic(api_key=self._api_key)
         prompt = build_prompt(title, content, lang)
-        headers = {
-            "x-api-key": self._api_key,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": self._MODEL,
-            "max_tokens": 512,
-            "temperature": 0.3,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        resp = _req.post(self._API_URL, json=payload, headers=headers, timeout=30)
-        resp.raise_for_status()
-        raw = resp.json()["content"][0]["text"]
+        message = client.messages.create(
+            model=self._MODEL,
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = message.content[0].text
         logger.debug("Claude raw response: %s", raw)
         return parse_llm_response(raw)
 
@@ -166,7 +148,6 @@ class MiniMaxProvider(BaseLLMProvider):
                 base = data.get("base_resp", {})
                 status_code = base.get("status_code", 0)
                 if status_code != 0:
-                    # 1000/520 are transient server errors — retry
                     if status_code in (1000,) and attempt < 2:
                         logger.warning("MiniMax transient error %s, retrying…", base.get("status_msg"))
                         last_err = RuntimeError(base.get("status_msg"))
@@ -226,8 +207,9 @@ def build_prompt(title: str, content: str, lang: str = "en") -> str:
             f"要求：\n"
             f"1. summary：3句话以内的中文摘要\n"
             f"2. comment：一句话中文点评，带观点倾向\n"
-            f"3. category：从以下分类中选一个：{categories}\n\n"
-            f'输出格式：{{"summary": "...", "comment": "...", "category": "AI科技"}}'
+            f"3. category：从以下分类中选一个：{categories}\n"
+            f"4. opinions：2-3条中文网民对此事件的典型舆论视角，每条不超过20字，JSON 数组\n\n"
+            f'输出格式：{{"summary": "...", "comment": "...", "category": "AI科技", "opinions": ["视角1", "视角2"]}}'
         )
     else:
         categories_en = ", ".join(CATEGORIES)
@@ -238,8 +220,9 @@ def build_prompt(title: str, content: str, lang: str = "en") -> str:
             f"Requirements:\n"
             f"1. summary: up to 3 sentences in English\n"
             f"2. comment: one opinionated sentence in English\n"
-            f"3. category: pick one from: {categories_en}\n\n"
-            f'Output format: {{"summary": "...", "comment": "...", "category": "AI科技"}}'
+            f"3. category: pick one from: {categories_en}\n"
+            f"4. opinions: 2-3 typical English-speaking public reactions to this story, each under 20 words, as a JSON array\n\n"
+            f'Output format: {{"summary": "...", "comment": "...", "category": "AI科技", "opinions": ["reaction 1", "reaction 2"]}}'
         )
 
 
@@ -255,4 +238,9 @@ def parse_llm_response(text: str) -> dict:
     assert "summary" in data and "comment" in data and "category" in data
     if data["category"] not in CATEGORIES:
         data["category"] = "其它"
+    # opinions is optional (zh only); normalise to list of strings
+    opinions = data.get("opinions", [])
+    if not isinstance(opinions, list):
+        opinions = []
+    data["opinions"] = [str(o) for o in opinions if o]
     return data
