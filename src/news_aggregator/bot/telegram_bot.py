@@ -82,6 +82,14 @@ def _select_articles(articles: list[dict], total: int) -> tuple[list[dict], list
             if cat_counts[cat] < cap:
                 picked.append(a)
                 cat_counts[cat] += 1
+        # Category cap may leave slots unfilled; fill remainder without cap constraint
+        if len(picked) < quota:
+            picked_ids = {id(a) for a in picked}
+            for a in ranked:
+                if len(picked) >= quota:
+                    break
+                if id(a) not in picked_ids:
+                    picked.append(a)
         return picked
 
     zh_picked = _pick_with_category_balance(zh_ranked, zh_quota)

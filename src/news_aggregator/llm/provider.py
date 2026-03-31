@@ -165,31 +165,61 @@ class MiniMaxProvider(BaseLLMProvider):
 
 
 # ---------------------------------------------------------------------------
+# Fallback provider — tries multiple providers in order
+# ---------------------------------------------------------------------------
+
+class FallbackProvider(BaseLLMProvider):
+    """按顺序尝试多个 Provider，全部失败则抛出异常。"""
+
+    def __init__(self, providers: list[tuple[str, BaseLLMProvider]]) -> None:
+        self._providers = providers  # [(name, provider), ...]
+
+    def analyze(self, title: str, content: str, lang: str = "en") -> dict:
+        last_err = None
+        for name, provider in self._providers:
+            try:
+                result = provider.analyze(title, content, lang)
+                logger.info("FallbackProvider: succeeded with %s", name)
+                return result
+            except Exception as e:
+                logger.warning("FallbackProvider: %s failed (%s), trying next…", name, e)
+                last_err = e
+        raise RuntimeError(f"All LLM providers failed. Last error: {last_err}")
+
+
+# ---------------------------------------------------------------------------
 # Factory — auto-selects provider, falls back to Mock when key is absent
 # ---------------------------------------------------------------------------
 
 def get_provider() -> BaseLLMProvider:
     """
-    Return the first configured real provider, or MockProvider if none are set.
-
-    Priority: GLM → Claude → MiniMax → Mock
+    按顺序收集所有配置的 Provider：GLM → MiniMax → Claude。
+    - 只有一个可用时直接返回该 Provider。
+    - 多个可用时返回 FallbackProvider（依序尝试）。
+    - 无可用 key 时返回 MockProvider。
     """
     glm_key = os.getenv("GLM_API_KEY", "").strip()
-    claude_key = os.getenv("CLAUDE_API_KEY", "").strip()
     minimax_key = os.getenv("MINIMAX_API_KEY", "").strip()
+    claude_key = os.getenv("CLAUDE_API_KEY", "").strip()
 
+    available = []
     if glm_key:
-        logger.info("LLM provider: GLM")
-        return GLMProvider(glm_key)
-    if claude_key:
-        logger.info("LLM provider: Claude")
-        return ClaudeProvider(claude_key)
+        available.append(("GLM", GLMProvider(glm_key)))
     if minimax_key:
-        logger.info("LLM provider: MiniMax")
-        return MiniMaxProvider(minimax_key)
+        available.append(("MiniMax", MiniMaxProvider(minimax_key)))
+    if claude_key:
+        available.append(("Claude", ClaudeProvider(claude_key)))
 
-    logger.info("LLM provider: Mock (no API key configured)")
-    return MockProvider()
+    if not available:
+        logger.info("LLM provider: Mock (no API key configured)")
+        return MockProvider()
+    if len(available) == 1:
+        logger.info("LLM provider: %s", available[0][0])
+        return available[0][1]
+
+    names = " → ".join(n for n, _ in available)
+    logger.info("LLM provider: FallbackProvider [%s]", names)
+    return FallbackProvider(available)
 
 
 # ---------------------------------------------------------------------------

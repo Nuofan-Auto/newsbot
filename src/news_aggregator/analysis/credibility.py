@@ -75,6 +75,18 @@ class CredibilityAnalyzer:
             bias="RIGHT",
             credibility_score=5,
         ),
+        "36氪": SourceRating(
+            source_name="36氪",
+            factual_reporting="HIGH",
+            bias="LEFT-CENTER",
+            credibility_score=7,
+        ),
+        "少数派": SourceRating(
+            source_name="少数派",
+            factual_reporting="HIGH",
+            bias="CENTER",
+            credibility_score=7,
+        ),
     }
 
     def __init__(
