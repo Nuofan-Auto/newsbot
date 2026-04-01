@@ -421,25 +421,49 @@ class NewsBot:
             return
 
         overview = _escape(result.get("overview", ""))
+        key_facts = result.get("key_facts", [])
+        latest_news = result.get("latest_news", [])
         perspectives = result.get("perspectives", [])
 
         if lang == "zh":
             header = f"🔎 *搜索：{_escape(topic)}*"
-            ov_label, rel_label, persp_label = "📌 话题概览", "🔗 相关资讯", "🗣️ 多方观点"
+            ov_label = "📌 话题概览"
+            facts_label = "📊 关键数据"
+            news_label = "📰 最新动态"
+            rel_label = "🔗 相关资讯"
+            persp_label = "🗣️ 多方观点"
         else:
             header = f"🔎 *Search: {_escape(topic)}*"
-            ov_label, rel_label, persp_label = "📌 Overview", "🔗 Related News", "🗣️ Perspectives"
+            ov_label = "📌 Overview"
+            facts_label = "📊 Key Facts"
+            news_label = "📰 Latest News"
+            rel_label = "🔗 Related Sources"
+            persp_label = "🗣️ Perspectives"
 
         lines = [header, ""]
+
         if overview:
             lines += [f"*{_escape(ov_label)}*", overview, ""]
 
+        if key_facts:
+            facts_bullets = "\n".join(f"• {_escape(str(f))}" for f in key_facts)
+            lines += [f"*{_escape(facts_label)}*", facts_bullets, ""]
+
+        if latest_news:
+            news_bullets = "\n".join(f"• {_escape(str(n))}" for n in latest_news)
+            lines += [f"*{_escape(news_label)}*", news_bullets, ""]
+
         if search_results:
-            rel_bullets = "\n".join(
-                f"• *{_escape(r['title'])}*: {_escape(r['snippet'])}"
-                for r in search_results[:5]
-            )
-            lines += [f"*{_escape(rel_label)}*", rel_bullets, ""]
+            rel_lines = []
+            for r in search_results[:5]:
+                title_text = _escape(r["title"])
+                snippet_text = _escape(r["snippet"])
+                url = r.get("url", "")
+                if url:
+                    rel_lines.append(f"• [{title_text}]({url}): {snippet_text}")
+                else:
+                    rel_lines.append(f"• *{title_text}*: {snippet_text}")
+            lines += [f"*{_escape(rel_label)}*", "\n".join(rel_lines), ""]
 
         if perspectives:
             persp_bullets = "\n".join(f"• \\[AI\\] {_escape(str(p))}" for p in perspectives)

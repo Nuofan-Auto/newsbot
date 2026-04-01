@@ -374,36 +374,45 @@ def parse_explore_response(text: str) -> dict:
 
 
 def build_search_prompt(topic: str, lang: str, search_results: list[dict]) -> str:
-    """Build a topic-search synthesis prompt with optional DDG context."""
+    """Build an enriched topic-search synthesis prompt with DDG context."""
     snippets_text = ""
     if search_results:
-        lines = [
-            f"{i + 1}. {r.get('title', '')}: {r.get('snippet', '')}"
-            for i, r in enumerate(search_results[:5])
-        ]
+        lines = []
+        for i, r in enumerate(search_results[:6]):
+            url_hint = f" [{r['url']}]" if r.get("url") else (
+                f" [{r['display_url']}]" if r.get("display_url") else ""
+            )
+            lines.append(f"{i + 1}. {r.get('title', '')}{url_hint}: {r.get('snippet', '')}")
         snippets_text = "\n".join(lines)
 
     if lang == "zh":
-        search_section = f"\n\n网络搜索结果：\n{snippets_text}" if snippets_text else ""
+        search_section = f"\n\n近期网络搜索结果：\n{snippets_text}" if snippets_text else ""
         return (
             f"请根据以下信息对话题「{topic}」进行综合分析，严格返回 JSON，不要有任何额外内容。"
             f"{search_section}\n\n"
-            f"要求：\n"
-            f"1. overview：2-3句话的话题概述\n"
-            f"2. perspectives：2-3条不同立场或群体的观点，每条不超过30字，JSON数组\n\n"
-            f'输出格式：{{"overview":"...","perspectives":["...","..."]}}'
+            f"要求（内容精炼，控制长度）：\n"
+            f"1. overview：3-4句话的话题概述，包含最新动态\n"
+            f"2. key_facts：从搜索结果中提炼3-5条具体事实、数据或进展，每条不超过25字，JSON数组\n"
+            f"3. latest_news：2-3条最近发生的具体事件或新闻，每条不超过30字，JSON数组\n"
+            f"4. perspectives：2-3条不同立场或群体的观点，每条不超过25字，JSON数组\n\n"
+            f'输出格式：{{"overview":"...","key_facts":["..."],"latest_news":["..."],"perspectives":["..."]}}'
         )
     else:
-        search_section = f"\n\nWeb search results:\n{snippets_text}" if snippets_text else ""
+        search_section = f"\n\nRecent web search results:\n{snippets_text}" if snippets_text else ""
         return (
-            f"Analyze the topic \"{topic}\" based on the information below. "
+            f"Analyze the topic \"{topic}\" using the search results below. "
             f"Return strictly a JSON object with no extra content."
             f"{search_section}\n\n"
-            f"Requirements:\n"
-            f"1. overview: 2-3 sentences summarizing the topic\n"
-            f"2. perspectives: 2-3 viewpoints from different stakeholders or groups, "
-            f"each under 30 words, as a JSON array\n\n"
-            f'Output format: {{"overview":"...","perspectives":["...","..."]}}'
+            f"Requirements (be concise to stay within token budget):\n"
+            f"1. overview: 3-4 sentences covering current state and recent developments\n"
+            f"2. key_facts: 3-5 concrete facts, figures, or named developments extracted "
+            f"from the search results above, each under 20 words, as a JSON array\n"
+            f"3. latest_news: 2-3 most recent specific events or updates, "
+            f"each under 25 words, as a JSON array\n"
+            f"4. perspectives: 2-3 viewpoints from different stakeholders or groups, "
+            f"each under 25 words, as a JSON array\n\n"
+            f'Output format: {{"overview":"...","key_facts":["...","..."],'
+            f'"latest_news":["...","..."],"perspectives":["...","..."]}}'
         )
 
 
@@ -421,4 +430,8 @@ def parse_search_response(text: str) -> dict:
     if "perspectives" not in data or not isinstance(data["perspectives"], list):
         data["perspectives"] = []
     data["perspectives"] = [str(o) for o in data["perspectives"] if o]
+    for key in ("key_facts", "latest_news"):
+        if key not in data or not isinstance(data[key], list):
+            data[key] = []
+        data[key] = [str(o) for o in data[key] if o]
     return data
