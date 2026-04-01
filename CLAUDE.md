@@ -8,8 +8,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Install dependencies
 pip install -r requirements.txt
 
-# Run the Telegram bot
+# Run the Telegram bot (auto-daemonizes; returns to shell immediately)
 python main.py
+
+# Stop the bot
+kill $(cat newsbot.pid)
+
+# View live logs
+tail -f logs/newsbot.log
 
 # Test pipeline without Telegram (fetch + analyze all articles)
 python scripts/test_fetch.py
@@ -28,10 +34,10 @@ Both test scripts call `load_dotenv()` to read `.env` — required for real LLM 
 See `.env.example`. Required:
 - `TELEGRAM_BOT_TOKEN` — mandatory to run the bot
 
-LLM provider keys (first available wins; falls back to Mock if none set):
-1. `GLM_API_KEY` (ZhipuAI `glm-5`) — preferred
-2. `CLAUDE_API_KEY` (Anthropic `claude-sonnet-4-6`)
-3. `MINIMAX_API_KEY` (MiniMax `MiniMax-Text-01`)
+LLM provider keys — all configured keys are used with runtime fallback (GLM → MiniMax → Claude); falls back to Mock if none set:
+1. `GLM_API_KEY` (ZhipuAI `glm-5`) — tried first
+2. `MINIMAX_API_KEY` (MiniMax `MiniMax-Text-01`) — tried second
+3. `CLAUDE_API_KEY` (Anthropic `claude-sonnet-4-6`) — tried third
 
 ## Architecture
 
@@ -55,7 +61,7 @@ RSS Feeds → RSSFetcher (lang per source) → NewsPipeline._enrich() → Articl
 | `scrapers/rss_fetcher.py` | `feedparser`-based fetcher; accepts `source_langs` list, stamps each article with `lang` field |
 | `scrapers/hn_comments.py` | Fetches top N HN comments via Algolia API for English articles; returns `[]` on miss |
 | `analysis/credibility.py` | MBFC-style ratings (score 1–10, bias label); unknown sources fall back to score=5 via plain dict (use `hasattr(rating, "credibility_score")` to guard) |
-| `llm/provider.py` | `get_provider()` factory; `build_prompt(title, content, lang)` switches between Chinese and English prompts; GLM and Claude use `anthropic` SDK; MiniMax uses HTTP with retry |
+| `llm/provider.py` | `get_provider()` factory returns `FallbackProvider` when multiple keys configured; `build_prompt(title, content, lang)` switches between Chinese and English prompts; GLM and Claude use `anthropic` SDK; MiniMax uses HTTP with retry |
 | `llm/analyzer.py` | Extracts `lang` from article dict, passes to `provider.analyze(title, content, lang)`; serializes `opinions` → `comments_json` |
 | `bot/telegram_bot.py` | `_select_articles()` applies zh/en quota + 40% category cap; `_build_lang_block()` renders category-grouped text; `/news` sends zh block → separator → en block |
 
@@ -84,7 +90,7 @@ Two-stage selection — pipeline then bot:
 
 2. **`bot._select_articles(articles, total)`** — final display selection after LLM:
    - Same zh/en quota split
-   - Within each language: category cap at 40% of quota (`CATEGORY_MAX_RATIO`)
+   - Within each language: category cap at 40% of quota (`CATEGORY_MAX_RATIO`) as preference; if cap leaves slots unfilled (e.g. all articles in same category), a second pass fills remainder without the cap — guarantees total = N
    - Filters out articles with `【分析失败】`
 
 ### LLM provider pattern
@@ -99,7 +105,9 @@ All providers inherit `BaseLLMProvider` (ABC) and implement `analyze(title, cont
 
 **MiniMaxProvider**: uses raw `requests` HTTP with 3-attempt retry loop and `base_resp.status_code` / `output_sensitive` checks. No `anthropic` SDK (no official Anthropic-compatible base_url).
 
-To add a new provider: subclass `BaseLLMProvider`, implement `analyze()`, add env var check to `get_provider()`.
+**FallbackProvider**: wraps a `list[tuple[str, BaseLLMProvider]]`; tries each in order, logs warning on failure, raises `RuntimeError` only if all fail. `get_provider()` returns this when ≥2 keys are configured.
+
+To add a new provider: subclass `BaseLLMProvider`, implement `analyze()`, add env var + `available.append(...)` in `get_provider()`.
 
 ### Caching
 
@@ -115,7 +123,21 @@ To force re-analysis: delete rows from `data/articles.db` or `rm data/articles.d
 
 ### Adding credibility sources
 
-Pass `extra_sources` dict to `CredibilityAnalyzer.__init__()`, or call `load_sources()` at runtime. Built-in entries: BBC News, Reuters, TechCrunch, CNN, Fox News. Unknown sources return a plain dict with score=5 — always guard with `hasattr(rating, "credibility_score")`.
+Pass `extra_sources` dict to `CredibilityAnalyzer.__init__()`, or call `load_sources()` at runtime. Built-in entries: BBC News, Reuters, TechCrunch, CNN, Fox News, 36氪 (score=7), 少数派 (score=7). Unknown sources return a plain dict with score=5 — always guard with `hasattr(rating, "credibility_score")`.
+
+### Process management & logging
+
+`main.py` auto-daemonizes on startup (double-fork): the process detaches from the terminal, redirects stdin/stdout/stderr to `/dev/null`, and writes its PID to `newsbot.pid`.
+
+Logs go to `logs/newsbot.log` via `RotatingFileHandler` (10 MB per file, 5 backups, ~60 MB total cap). When a file hits 10 MB it rotates: `.log` → `.log.1` → … → `.log.5` (oldest deleted). Logging never stops due to disk pressure from log growth.
+
+```bash
+python main.py           # start daemon
+kill $(cat newsbot.pid)  # stop daemon
+tail -f logs/newsbot.log # follow logs
+```
+
+`logs/` and `newsbot.pid` are gitignored.
 
 ## LLM Output Format
 

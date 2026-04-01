@@ -11,6 +11,7 @@ import yaml
 
 from news_aggregator.scrapers.rss_fetcher import RSSFetcher
 from news_aggregator.scrapers.hn_comments import fetch_hn_comments
+from news_aggregator.scrapers.reddit_comments import fetch_reddit_comments
 from news_aggregator.analysis.credibility import CredibilityAnalyzer
 from news_aggregator.llm.analyzer import NewsAnalyzer
 from news_aggregator.storage import ArticleStore
@@ -104,16 +105,23 @@ class NewsPipeline:
         cached = self._store.get_cached(link) if link else None
         if cached:
             article = {**article, **cached}
+            llm_ok = True
         else:
             rss_summary = article.get("summary", "")
             article = self._llm.analyze(article)
             llm_ok = article.pop("_llm_ok", False)
-            if llm_ok and article.get("lang") == "en":
-                hn = fetch_hn_comments(article.get("title", ""))
-                if hn:  # HN results override LLM opinions; otherwise keep LLM fallback
-                    article["comments_json"] = json.dumps(hn, ensure_ascii=False)
             if link and llm_ok:
                 self._store.upsert({**article, "summary_raw": rss_summary})
+
+        # Always refresh HN/Reddit for English articles (free APIs, no auth required).
+        # Running outside the cache branch ensures source tags are always present.
+        if llm_ok and article.get("lang") == "en":
+            title = article.get("title", "")
+            hn = fetch_hn_comments(title)
+            reddit = fetch_reddit_comments(title)
+            combined = (hn + reddit)[:3]  # HN priority, Reddit fills remaining slots
+            if combined:
+                article["comments_json"] = json.dumps(combined, ensure_ascii=False)
 
         return article
 

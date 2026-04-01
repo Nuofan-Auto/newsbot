@@ -7,7 +7,7 @@ Usage:
     # -> {"summary": "...", "comment": "...", "category": "AI科技"}
 
 Adding a new provider:
-    1. Subclass BaseLLMProvider and implement analyze()
+    1. Subclass BaseLLMProvider and implement _call_api() and analyze()
     2. Register it in get_provider() below
 """
 import os
@@ -23,6 +23,10 @@ CATEGORIES = ["AI科技", "经济金融", "国际政治", "民生社会", "科�
 
 class BaseLLMProvider(ABC):
     """Common interface every provider must implement."""
+
+    @abstractmethod
+    def _call_api(self, prompt: str) -> str:
+        """Call the underlying LLM API with a raw prompt string, return raw text."""
 
     @abstractmethod
     def analyze(self, title: str, content: str, lang: str = "en") -> dict:
@@ -46,6 +50,17 @@ class BaseLLMProvider(ABC):
 class MockProvider(BaseLLMProvider):
     """Placeholder that returns stub values — no API calls, no cost."""
 
+    def _call_api(self, prompt: str) -> str:
+        return json.dumps({
+            "summary": "【待接入LLM】",
+            "comment": "【待接入LLM】",
+            "category": random.choice(CATEGORIES),
+            "background": "【待接入LLM】",
+            "implications": "【待接入LLM】",
+            "perspectives": [],
+            "related": [],
+        })
+
     def analyze(self, title: str, content: str, lang: str = "en") -> dict:
         return {
             "summary": "【待接入LLM】",
@@ -67,11 +82,10 @@ class GLMProvider(BaseLLMProvider):
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key
 
-    def analyze(self, title: str, content: str, lang: str = "en") -> dict:
+    def _call_api(self, prompt: str) -> str:
         import anthropic
 
         client = anthropic.Anthropic(api_key=self._api_key, base_url=self._BASE_URL)
-        prompt = build_prompt(title, content, lang)
         message = client.messages.create(
             model=self._MODEL,
             max_tokens=1024,
@@ -79,7 +93,10 @@ class GLMProvider(BaseLLMProvider):
         )
         raw = message.content[0].text
         logger.debug("GLM raw response: %s", raw)
-        return parse_llm_response(raw)
+        return raw
+
+    def analyze(self, title: str, content: str, lang: str = "en") -> dict:
+        return parse_llm_response(self._call_api(build_prompt(title, content, lang)))
 
 
 # ---------------------------------------------------------------------------
@@ -94,11 +111,10 @@ class ClaudeProvider(BaseLLMProvider):
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key
 
-    def analyze(self, title: str, content: str, lang: str = "en") -> dict:
+    def _call_api(self, prompt: str) -> str:
         import anthropic
 
         client = anthropic.Anthropic(api_key=self._api_key)
-        prompt = build_prompt(title, content, lang)
         message = client.messages.create(
             model=self._MODEL,
             max_tokens=512,
@@ -106,7 +122,10 @@ class ClaudeProvider(BaseLLMProvider):
         )
         raw = message.content[0].text
         logger.debug("Claude raw response: %s", raw)
-        return parse_llm_response(raw)
+        return raw
+
+    def analyze(self, title: str, content: str, lang: str = "en") -> dict:
+        return parse_llm_response(self._call_api(build_prompt(title, content, lang)))
 
 
 # ---------------------------------------------------------------------------
@@ -122,11 +141,10 @@ class MiniMaxProvider(BaseLLMProvider):
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key
 
-    def analyze(self, title: str, content: str, lang: str = "en") -> dict:
+    def _call_api(self, prompt: str) -> str:
         import time
         import requests as _req
 
-        prompt = build_prompt(title, content, lang)
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
@@ -155,13 +173,16 @@ class MiniMaxProvider(BaseLLMProvider):
                     raise RuntimeError(f"MiniMax API error {status_code}: {base.get('status_msg')}")
                 raw = data["choices"][0]["message"]["content"]
                 if not raw or data.get("output_sensitive"):
-                    logger.warning("MiniMax: empty/sensitive response for '%s'", title[:40])
-                    return {"summary": "【内容审核屏蔽】", "comment": "【内容审核屏蔽】", "category": "其它"}
+                    logger.warning("MiniMax: empty/sensitive response for prompt starting '%s'", prompt[:40])
+                    return json.dumps({"summary": "【内容审核屏蔽】", "comment": "【内容审核屏蔽】", "category": "其它"})
                 logger.debug("MiniMax raw response: %s", raw)
-                return parse_llm_response(raw)
+                return raw
             except _req.RequestException as e:
                 last_err = e
         raise RuntimeError(f"MiniMax failed after retries: {last_err}")
+
+    def analyze(self, title: str, content: str, lang: str = "en") -> dict:
+        return parse_llm_response(self._call_api(build_prompt(title, content, lang)))
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +194,18 @@ class FallbackProvider(BaseLLMProvider):
 
     def __init__(self, providers: list[tuple[str, BaseLLMProvider]]) -> None:
         self._providers = providers  # [(name, provider), ...]
+
+    def _call_api(self, prompt: str) -> str:
+        last_err = None
+        for name, provider in self._providers:
+            try:
+                raw = provider._call_api(prompt)
+                logger.info("FallbackProvider._call_api: succeeded with %s", name)
+                return raw
+            except Exception as e:
+                logger.warning("FallbackProvider._call_api: %s failed (%s), trying next…", name, e)
+                last_err = e
+        raise RuntimeError(f"All LLM providers failed. Last error: {last_err}")
 
     def analyze(self, title: str, content: str, lang: str = "en") -> dict:
         last_err = None
@@ -256,6 +289,50 @@ def build_prompt(title: str, content: str, lang: str = "en") -> str:
         )
 
 
+def build_explore_prompt(title: str, summary: str, comment: str, lang: str,
+                         search_results: list[dict]) -> str:
+    """Build a deep-dive analysis prompt with optional web search context."""
+    snippets_text = ""
+    if search_results:
+        lines = [
+            f"{i + 1}. {r.get('title', '')}: {r.get('snippet', '')}"
+            for i, r in enumerate(search_results[:5])
+        ]
+        snippets_text = "\n".join(lines)
+
+    if lang == "zh":
+        search_section = f"\n\n网络搜索结果（供参考）：\n{snippets_text}" if snippets_text else ""
+        return (
+            f"请对以下新闻进行深度解读，严格返回 JSON，不要有任何额外内容。\n\n"
+            f"标题：{title}\n"
+            f"摘要：{summary[:400]}\n"
+            f"点评：{comment[:200]}"
+            f"{search_section}\n\n"
+            f"要求：\n"
+            f"1. background：2-3句话的背景与来龙去脉\n"
+            f"2. implications：2-3句话的影响与未来走向\n"
+            f"3. perspectives：2-3条不同立场的观点，每条不超过25字，JSON数组\n"
+            f"4. related：1-2条相关进展或事件，每条不超过30字，JSON数组\n\n"
+            f'输出格式：{{"background":"...","implications":"...","perspectives":["...","..."],"related":["..."]}}'
+        )
+    else:
+        search_section = f"\n\nWeb search context:\n{snippets_text}" if snippets_text else ""
+        return (
+            f"Provide a deep-dive analysis of the following news article. "
+            f"Return strictly a JSON object with no extra content.\n\n"
+            f"Title: {title}\n"
+            f"Summary: {summary[:400]}\n"
+            f"Comment: {comment[:200]}"
+            f"{search_section}\n\n"
+            f"Requirements:\n"
+            f"1. background: 2-3 sentences on the context and events leading to this story\n"
+            f"2. implications: 2-3 sentences on likely consequences and future developments\n"
+            f"3. perspectives: 2-3 viewpoints from different stakeholders, each under 25 words, as a JSON array\n"
+            f"4. related: 1-2 related developments or events, each under 30 words, as a JSON array\n\n"
+            f'Output format: {{"background":"...","implications":"...","perspectives":["...","..."],"related":["..."]}}'
+        )
+
+
 def parse_llm_response(text: str) -> dict:
     """Extract and validate JSON from raw LLM output."""
     if not text or text.strip() == "":
@@ -273,4 +350,75 @@ def parse_llm_response(text: str) -> dict:
     if not isinstance(opinions, list):
         opinions = []
     data["opinions"] = [str(o) for o in opinions if o]
+    return data
+
+
+def parse_explore_response(text: str) -> dict:
+    """Extract and validate JSON from a deep-dive LLM response."""
+    if not text or text.strip() == "":
+        raise ValueError("LLM returned empty response")
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start == -1 or end == 0:
+        raise ValueError(f"No JSON object found in response: {text[:200]}")
+    data = json.loads(text[start:end])
+    # Fill missing keys with safe defaults
+    for key in ("background", "implications"):
+        if key not in data:
+            data[key] = ""
+    for key in ("perspectives", "related"):
+        if key not in data or not isinstance(data[key], list):
+            data[key] = []
+        data[key] = [str(o) for o in data[key] if o]
+    return data
+
+
+def build_search_prompt(topic: str, lang: str, search_results: list[dict]) -> str:
+    """Build a topic-search synthesis prompt with optional DDG context."""
+    snippets_text = ""
+    if search_results:
+        lines = [
+            f"{i + 1}. {r.get('title', '')}: {r.get('snippet', '')}"
+            for i, r in enumerate(search_results[:5])
+        ]
+        snippets_text = "\n".join(lines)
+
+    if lang == "zh":
+        search_section = f"\n\n网络搜索结果：\n{snippets_text}" if snippets_text else ""
+        return (
+            f"请根据以下信息对话题「{topic}」进行综合分析，严格返回 JSON，不要有任何额外内容。"
+            f"{search_section}\n\n"
+            f"要求：\n"
+            f"1. overview：2-3句话的话题概述\n"
+            f"2. perspectives：2-3条不同立场或群体的观点，每条不超过30字，JSON数组\n\n"
+            f'输出格式：{{"overview":"...","perspectives":["...","..."]}}'
+        )
+    else:
+        search_section = f"\n\nWeb search results:\n{snippets_text}" if snippets_text else ""
+        return (
+            f"Analyze the topic \"{topic}\" based on the information below. "
+            f"Return strictly a JSON object with no extra content."
+            f"{search_section}\n\n"
+            f"Requirements:\n"
+            f"1. overview: 2-3 sentences summarizing the topic\n"
+            f"2. perspectives: 2-3 viewpoints from different stakeholders or groups, "
+            f"each under 30 words, as a JSON array\n\n"
+            f'Output format: {{"overview":"...","perspectives":["...","..."]}}'
+        )
+
+
+def parse_search_response(text: str) -> dict:
+    """Extract and validate JSON from a topic-search LLM response."""
+    if not text or text.strip() == "":
+        raise ValueError("LLM returned empty response")
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start == -1 or end == 0:
+        raise ValueError(f"No JSON object found in response: {text[:200]}")
+    data = json.loads(text[start:end])
+    if "overview" not in data:
+        data["overview"] = ""
+    if "perspectives" not in data or not isinstance(data["perspectives"], list):
+        data["perspectives"] = []
+    data["perspectives"] = [str(o) for o in data["perspectives"] if o]
     return data

@@ -53,7 +53,7 @@ def fetch_hn_comments(title: str, n: int = 3) -> list[str]:
         for c in top_comments[:n]:
             text = _strip_html(c["text"])
             if text:
-                results.append(text)
+                results.append({"text": text, "source": "HN"})
         return results
 
     except Exception as e:

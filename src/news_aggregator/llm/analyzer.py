@@ -41,9 +41,10 @@ class NewsAnalyzer:
             llm_ok = False
 
         # Serialise opinions into comments_json for both zh and en.
-        # For en, pipeline will overwrite with HN comments if available.
+        # For en, pipeline will overwrite with HN/Reddit comments if available.
         opinions = result.pop("opinions", [])
         if opinions:
-            result["comments_json"] = json.dumps(opinions, ensure_ascii=False)
+            tagged = [{"text": str(o), "source": "AI"} for o in opinions]
+            result["comments_json"] = json.dumps(tagged, ensure_ascii=False)
 
         return {**article, **result, "_llm_ok": llm_ok}

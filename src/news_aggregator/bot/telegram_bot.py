@@ -10,6 +10,11 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from news_aggregator.pipeline import NewsPipeline
 from news_aggregator.analysis.credibility import CredibilityAnalyzer
+from news_aggregator.llm.provider import (
+    get_provider, build_explore_prompt, parse_explore_response,
+    build_search_prompt, parse_search_response,
+)
+from news_aggregator.scrapers.web_search import search_related
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +39,19 @@ def _escape(text: str) -> str:
     for ch in r"\_*[]()~`>#+-=|{}.!":
         text = text.replace(ch, f"\\{ch}")
     return text
+
+
+def _detect_lang(text: str) -> str:
+    """Return 'zh' if text contains CJK characters, else 'en'."""
+    return "zh" if any("\u4e00" <= c <= "\u9fff" for c in text) else "en"
+
+
+def _parse_comment(c) -> tuple[str, str]:
+    """Return (text, source) from a comment entry.
+    Accepts both dict format {"text":…,"source":…} and legacy plain strings."""
+    if isinstance(c, dict):
+        return c.get("text", ""), c.get("source", "")
+    return str(c), ""
 
 
 def _rank_articles(articles: list[dict], top_n: int) -> list[dict]:
@@ -130,8 +148,10 @@ def _split_messages(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
     return chunks
 
 
-def _build_lang_block(articles: list[dict], serial_start: int) -> tuple[str, int]:
-    """Build category-grouped text block for one language group. Returns (text, next_serial)."""
+def _build_lang_block(articles: list[dict], serial_start: int) -> tuple[str, int, list[dict]]:
+    """Build category-grouped text block for one language group.
+    Returns (text, next_serial, display_ordered_articles) where display_ordered_articles
+    matches the serial numbers shown in the text."""
     cat_order = list(CATEGORY_EMOJI.keys())
     grouped: dict[str, list] = defaultdict(list)
     for a in articles:
@@ -142,6 +162,7 @@ def _build_lang_block(articles: list[dict], serial_start: int) -> tuple[str, int
 
     serial = serial_start
     blocks = []
+    display_ordered: list[dict] = []
     for cat in cat_order:
         items = grouped.get(cat)
         if not items:
@@ -159,11 +180,16 @@ def _build_lang_block(articles: list[dict], serial_start: int) -> tuple[str, int
                 opinions = json.loads(a.get("comments_json") or "[]")[:3]
                 if opinions:
                     label = "热评" if a.get("lang") == "zh" else "Reactions"
-                    bullets = "\n".join(
-                        f"   • {_escape(str(o))}"
-                        for o in opinions
-                    )
-                    comments_block = f"\n   💬 *{label}：*\n{bullets}"
+                    bullet_lines = []
+                    is_zh = a.get("lang") == "zh"
+                    for o in opinions:
+                        text, source = _parse_comment(o)
+                        # zh comments always come from LLM; infer [AI] for old cached plain strings
+                        if not source and is_zh:
+                            source = "AI"
+                        prefix = f"\\[{_escape(source)}\\] " if source else ""
+                        bullet_lines.append(f"   • {prefix}{_escape(text)}")
+                    comments_block = f"\n   💬 *{label}：*\n" + "\n".join(bullet_lines)
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -175,16 +201,19 @@ def _build_lang_block(articles: list[dict], serial_start: int) -> tuple[str, int
                 f"   🔗 [阅读全文]({link})"
             )
             lines.append(entry)
+            display_ordered.append(a)
             serial += 1
         blocks.append("\n\n".join(lines))
 
-    return "\n\n".join(blocks), serial
+    return "\n\n".join(blocks), serial, display_ordered
 
 
 class NewsBot:
     def __init__(self, token: str) -> None:
         self._token = token
         self._pipeline = NewsPipeline(language="zh")
+        self._provider = get_provider()
+        self._session_articles: dict[int, list[dict]] = {}  # chat_id → ordered article list
 
     def build_app(self) -> Application:
         app = Application.builder().token(self._token).build()
@@ -192,6 +221,8 @@ class NewsBot:
         app.add_handler(CommandHandler("help", self._help))
         app.add_handler(CommandHandler("news", self._news))
         app.add_handler(CommandHandler("sources", self._sources))
+        app.add_handler(CommandHandler("explore", self._explore))
+        app.add_handler(CommandHandler("search", self._search))
         return app
 
     # ------------------------------------------------------------------
@@ -206,6 +237,8 @@ class NewsBot:
             "我是 *AI News Aggregator*，帮你聚合中英文权威新闻、标注来源可信度并提供 AI 摘要。\n\n"
             "📰 *可用功能：*\n"
             "• /news \\[篇数\\] — 获取最新新闻，默认10篇（中英各半，含AI摘要与点评）\n"
+            "• /explore \\[编号\\] — 对某篇新闻进行深度解读，获取背景、影响与多方观点\n"
+            "• /search \\[话题\\] — 搜索任意话题，获取概览与多方观点\n"
             "• /sources — 查看新闻源可信度评级\n"
             "• /help — 查看帮助\n\n"
             "中文来源：36氪、少数派\n"
@@ -219,6 +252,8 @@ class NewsBot:
             "📖 *命令列表*\n\n"
             "/start — 欢迎介绍\n"
             "/news \\[篇数\\] — 获取新闻，默认10篇，最多50篇（中英各半）\n"
+            "/explore \\[编号\\] — 深度解读 /news 中的某篇文章（背景、影响、多方观点）\n"
+            "/search \\[话题\\] — 搜索任意话题，获取概览、相关资讯与多方观点\n"
             "/sources — 展示所有新闻源及可信度对比排名\n"
             "/help — 显示本帮助信息"
         )
@@ -257,11 +292,13 @@ class NewsBot:
             return
 
         serial = 1
+        zh_ordered: list[dict] = []
+        en_ordered: list[dict] = []
 
         # Chinese block
         if zh_articles:
             header_zh = "【🇨🇳 中文新闻】"
-            zh_body, serial = _build_lang_block(zh_articles, serial)
+            zh_body, serial, zh_ordered = _build_lang_block(zh_articles, serial)
             full_zh = f"{header_zh}\n\n{zh_body}"
             for chunk in _split_messages(full_zh):
                 await update.message.reply_text(chunk, parse_mode="MarkdownV2")
@@ -273,10 +310,144 @@ class NewsBot:
         # English block
         if en_articles:
             header_en = "【🌐 英文新闻】"
-            en_body, serial = _build_lang_block(en_articles, serial)
+            en_body, serial, en_ordered = _build_lang_block(en_articles, serial)
             full_en = f"{header_en}\n\n{en_body}"
             for chunk in _split_messages(full_en):
                 await update.message.reply_text(chunk, parse_mode="MarkdownV2")
+
+        # Store display-ordered articles for /explore so serial numbers match exactly
+        self._session_articles[update.effective_chat.id] = zh_ordered + en_ordered
+
+    async def _explore(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
+
+        if not context.args:
+            await update.message.reply_text(
+                "用法：/explore \\<编号\\>，编号对应最近一次 /news 中的文章序号，例如 `/explore 3`",
+                parse_mode="MarkdownV2",
+            )
+            return
+
+        try:
+            n = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("⚠️ 请输入有效的文章编号，例如 /explore 3")
+            return
+
+        session = self._session_articles.get(chat_id, [])
+        if not session:
+            await update.message.reply_text("⚠️ 请先运行 /news 获取新闻，然后再使用 /explore \\<编号\\>", parse_mode="MarkdownV2")
+            return
+
+        if n < 1 or n > len(session):
+            await update.message.reply_text(f"⚠️ 文章编号 {n} 不存在，请在 1 到 {len(session)} 之间选择")
+            return
+
+        article = session[n - 1]
+        title = article.get("title", "")
+        summary = article.get("summary", "")
+        comment = article.get("comment", "")
+        lang = article.get("lang", "zh")
+
+        logger.info("/explore n=%d chat_id=%d title='%s'", n, chat_id, title[:50])
+        loading = "🔍 正在深度解读，请稍候……" if lang == "zh" else "🔍 Deep diving into this article, please wait…"
+        await update.message.reply_text(loading)
+
+        search_results = await asyncio.to_thread(search_related, title, 5)
+
+        try:
+            prompt = build_explore_prompt(title, summary, comment, lang, search_results)
+            raw = await asyncio.to_thread(self._provider._call_api, prompt)
+            result = parse_explore_response(raw)
+        except Exception as e:
+            logger.error("Explore LLM error for '%s': %s", title[:50], e)
+            err_msg = "⚠️ 深度解读失败，请稍后再试。" if lang == "zh" else "⚠️ Deep dive failed, please try again later."
+            await update.message.reply_text(err_msg)
+            return
+
+        background = _escape(result.get("background", ""))
+        implications = _escape(result.get("implications", ""))
+        perspectives = result.get("perspectives", [])
+        related = result.get("related", [])
+
+        if lang == "zh":
+            header = f"🔍 *深度解读：{_escape(title)}*"
+            bg_label, imp_label, persp_label, rel_label = "📚 背景", "🔮 影响", "🗣️ 各方观点", "🔗 相关进展"
+        else:
+            header = f"🔍 *Deep Dive: {_escape(title)}*"
+            bg_label, imp_label, persp_label, rel_label = "📚 Background", "🔮 Implications", "🗣️ Perspectives", "🔗 Related"
+
+        lines = [header, ""]
+        if background:
+            lines += [f"*{_escape(bg_label)}*", background, ""]
+        if implications:
+            lines += [f"*{_escape(imp_label)}*", implications, ""]
+        if perspectives:
+            bullets = "\n".join(f"• \\[AI\\] {_escape(str(p))}" for p in perspectives)
+            lines += [f"*{_escape(persp_label)}*", bullets, ""]
+        if related:
+            bullets = "\n".join(f"• {_escape(str(r))}" for r in related)
+            lines += [f"*{_escape(rel_label)}*", bullets]
+
+        text = "\n".join(lines)
+        for chunk in _split_messages(text):
+            await update.message.reply_text(chunk, parse_mode="MarkdownV2")
+
+    async def _search(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not context.args:
+            await update.message.reply_text(
+                "用法：/search \\<话题\\>，例如 `/search AI芯片战争`",
+                parse_mode="MarkdownV2",
+            )
+            return
+
+        topic = " ".join(context.args)
+        lang = _detect_lang(topic)
+        logger.info("/search topic='%s' lang=%s from user id=%s", topic[:60], lang, update.effective_user.id)
+
+        loading = f"🔎 正在搜索「{topic}」……" if lang == "zh" else f"🔎 Searching for \"{topic}\"…"
+        await update.message.reply_text(loading)
+
+        search_results = await asyncio.to_thread(search_related, topic, 8)
+
+        try:
+            prompt = build_search_prompt(topic, lang, search_results)
+            raw = await asyncio.to_thread(self._provider._call_api, prompt)
+            result = parse_search_response(raw)
+        except Exception as e:
+            logger.error("Search LLM error for '%s': %s", topic[:60], e)
+            err = "⚠️ 搜索失败，请稍后再试。" if lang == "zh" else "⚠️ Search failed, please try again later."
+            await update.message.reply_text(err)
+            return
+
+        overview = _escape(result.get("overview", ""))
+        perspectives = result.get("perspectives", [])
+
+        if lang == "zh":
+            header = f"🔎 *搜索：{_escape(topic)}*"
+            ov_label, rel_label, persp_label = "📌 话题概览", "🔗 相关资讯", "🗣️ 多方观点"
+        else:
+            header = f"🔎 *Search: {_escape(topic)}*"
+            ov_label, rel_label, persp_label = "📌 Overview", "🔗 Related News", "🗣️ Perspectives"
+
+        lines = [header, ""]
+        if overview:
+            lines += [f"*{_escape(ov_label)}*", overview, ""]
+
+        if search_results:
+            rel_bullets = "\n".join(
+                f"• *{_escape(r['title'])}*: {_escape(r['snippet'])}"
+                for r in search_results[:5]
+            )
+            lines += [f"*{_escape(rel_label)}*", rel_bullets, ""]
+
+        if perspectives:
+            persp_bullets = "\n".join(f"• \\[AI\\] {_escape(str(p))}" for p in perspectives)
+            lines += [f"*{_escape(persp_label)}*", persp_bullets]
+
+        text = "\n".join(lines)
+        for chunk in _split_messages(text):
+            await update.message.reply_text(chunk, parse_mode="MarkdownV2")
 
     async def _sources(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("/sources from user id=%s", update.effective_user.id)
