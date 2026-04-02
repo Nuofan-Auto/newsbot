@@ -88,7 +88,7 @@ class GLMProvider(BaseLLMProvider):
         client = anthropic.Anthropic(api_key=self._api_key, base_url=self._BASE_URL)
         message = client.messages.create(
             model=self._MODEL,
-            max_tokens=1024,
+            max_tokens=2048,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = message.content[0].text
@@ -117,7 +117,7 @@ class ClaudeProvider(BaseLLMProvider):
         client = anthropic.Anthropic(api_key=self._api_key)
         message = client.messages.create(
             model=self._MODEL,
-            max_tokens=512,
+            max_tokens=2048,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = message.content[0].text
@@ -153,7 +153,7 @@ class MiniMaxProvider(BaseLLMProvider):
             "model": self._MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
-            "max_tokens": 512,
+            "max_tokens": 2048,
         }
         last_err = None
         for attempt in range(3):
@@ -174,7 +174,7 @@ class MiniMaxProvider(BaseLLMProvider):
                 raw = data["choices"][0]["message"]["content"]
                 if not raw or data.get("output_sensitive"):
                     logger.warning("MiniMax: empty/sensitive response for prompt starting '%s'", prompt[:40])
-                    return json.dumps({"summary": "【内容审核屏蔽】", "comment": "【内容审核屏蔽】", "category": "其它"})
+                    raise RuntimeError("MiniMax content filtered (output_sensitive)")
                 logger.debug("MiniMax raw response: %s", raw)
                 return raw
             except _req.RequestException as e:
@@ -338,9 +338,11 @@ def parse_llm_response(text: str) -> dict:
     if not text or text.strip() == "":
         raise ValueError("LLM returned empty response")
     start = text.find("{")
-    end = text.rfind("}") + 1
-    if start == -1 or end == 0:
+    if start == -1:
         raise ValueError(f"No JSON object found in response: {text[:200]}")
+    end = text.rfind("}") + 1
+    if end == 0:
+        raise ValueError(f"Truncated JSON response (no closing brace): {text[:200]}")
     data = json.loads(text[start:end])
     assert "summary" in data and "comment" in data and "category" in data
     if data["category"] not in CATEGORIES:
@@ -358,9 +360,11 @@ def parse_explore_response(text: str) -> dict:
     if not text or text.strip() == "":
         raise ValueError("LLM returned empty response")
     start = text.find("{")
-    end = text.rfind("}") + 1
-    if start == -1 or end == 0:
+    if start == -1:
         raise ValueError(f"No JSON object found in response: {text[:200]}")
+    end = text.rfind("}") + 1
+    if end == 0:
+        raise ValueError(f"Truncated JSON response (no closing brace): {text[:200]}")
     data = json.loads(text[start:end])
     # Fill missing keys with safe defaults
     for key in ("background", "implications"):
@@ -421,9 +425,11 @@ def parse_search_response(text: str) -> dict:
     if not text or text.strip() == "":
         raise ValueError("LLM returned empty response")
     start = text.find("{")
-    end = text.rfind("}") + 1
-    if start == -1 or end == 0:
+    if start == -1:
         raise ValueError(f"No JSON object found in response: {text[:200]}")
+    end = text.rfind("}") + 1
+    if end == 0:
+        raise ValueError(f"Truncated JSON response (no closing brace): {text[:200]}")
     data = json.loads(text[start:end])
     if "overview" not in data:
         data["overview"] = ""

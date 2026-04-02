@@ -87,6 +87,18 @@ class CredibilityAnalyzer:
             bias="CENTER",
             credibility_score=7,
         ),
+        "澎湃新闻": SourceRating(
+            source_name="澎湃新闻",
+            factual_reporting="HIGH",
+            bias="LEFT-CENTER",
+            credibility_score=7,
+        ),
+        "机器之心": SourceRating(
+            source_name="机器之心",
+            factual_reporting="HIGH",
+            bias="CENTER",
+            credibility_score=7,
+        ),
     }
 
     def __init__(

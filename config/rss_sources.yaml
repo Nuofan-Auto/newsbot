@@ -17,3 +17,9 @@ sources:
   - name: 少数派
     url: https://sspai.com/feed
     lang: zh
+  - name: 澎湃新闻
+    url: https://feedx.net/rss/thepaper.xml
+    lang: zh
+  - name: 机器之心
+    url: https://www.jiqizhixin.com/rss
+    lang: zh
