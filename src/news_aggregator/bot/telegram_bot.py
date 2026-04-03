@@ -216,7 +216,13 @@ class NewsBot:
         self._session_articles: dict[int, list[dict]] = {}  # chat_id → ordered article list
 
     def build_app(self) -> Application:
-        app = Application.builder().token(self._token).build()
+        app = (
+            Application.builder()
+            .token(self._token)
+            .get_updates_connection_pool_size(8)
+            .get_updates_pool_timeout(30.0)
+            .build()
+        )
         app.add_handler(CommandHandler("start", self._start))
         app.add_handler(CommandHandler("help", self._help))
         app.add_handler(CommandHandler("news", self._news))

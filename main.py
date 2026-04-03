@@ -1,3 +1,4 @@
+#!/home/ubuntu/miniconda3/envs/newsbot/bin/python
 """
 Entry point for AI News Aggregator Telegram Bot.
 """
